@@ -207,5 +207,6 @@ document.getElementById('apiRegisterForm').addEventListener('submit',async funct
 document.getElementById('apiLoginForm').addEventListener('submit',async function(e){e.preventDefault();const button=this.querySelector('button[type="submit"]');button.disabled=true;try{const token=await getCsrf();const data=await apiRequest('/api/login',{method:'POST',headers:{'X-CSRF-Token':token},body:JSON.stringify({email:document.getElementById('loginEmail').value.trim(),password:document.getElementById('loginPassword').value})});showToast('loginToast','Logged in to the demo account. Welcome, '+data.user.full_name+'.');this.reset()}catch(err){showToast('loginToast',err.message==='Failed to fetch'?'Could not connect yet. The API may still be deploying or its cross-site settings need adjustment.':err.message)}finally{button.disabled=false}});
 document.getElementById('year').textContent=new Date().getFullYear();
 </script>
+<!-- NEXORA_DEMO_LOGIN_CONNECTED: forms call the deployed API -->
 </body>
 </html>
