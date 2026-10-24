@@ -1,1 +1,174 @@
+import os
+import secrets
+import sqlite3
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
 
+from flask import Flask, g, jsonify, request, session
+from werkzeug.security import generate_password_hash, check_password_hash
+
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = os.getenv("DATABASE_PATH", str(APP_DIR / "nexora.db"))
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv("APP_SECRET", secrets.token_hex(32)),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "true").lower() == "true",
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=32 * 1024,
+)
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(_error=None):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
+def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      full_name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      country TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'investor',
+      created_at TEXT NOT NULL
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def json_error(message, code):
+    return jsonify({"ok": False, "error": message}), code
+
+def csrf_token():
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return session["csrf_token"]
+
+@app.before_request
+def protect_mutations():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.endpoint not in {"health"}:
+        supplied = request.headers.get("X-CSRF-Token", "")
+        expected = session.get("csrf_token", "")
+        if not expected or not secrets.compare_digest(supplied, expected):
+            return json_error("CSRF token missing or invalid. Fetch /api/csrf and retry.", 403)
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not session.get("user_id"):
+            return json_error("Please log in first.", 401)
+        return fn(*args, **kwargs)
+    return wrapped
+
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "service": "Nexora API starter", "mode": "account-demo", "time": datetime.now(timezone.utc).isoformat()})
+
+@app.get("/api/csrf")
+def get_csrf():
+    response = jsonify({"csrf_token": csrf_token()})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@app.post("/api/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    full_name = str(data.get("full_name", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
+    country = str(data.get("country", "")).strip()
+    password = str(data.get("password", ""))
+    if not full_name or len(full_name) > 120 or not country or len(country) > 80:
+        return json_error("Enter your full name and country.", 400)
+    if "@" not in email or len(email) > 254:
+        return json_error("Enter a valid email address.", 400)
+    if len(password) < 12:
+        return json_error("Password must be at least 12 characters.", 400)
+    try:
+        cur = db().execute(
+            "INSERT INTO users(full_name,email,country,password_hash,created_at) VALUES(?,?,?,?,?)",
+            (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat())
+        )
+        db().commit()
+    except sqlite3.IntegrityError:
+        return json_error("An account with that email already exists.", 409)
+    session.clear()
+    session["user_id"] = cur.lastrowid
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return jsonify({"ok": True, "message": "Account created. This is a starter account system, not a verified investment account.", "user": {"id": cur.lastrowid, "full_name": full_name, "email": email, "country": country}}), 201
+
+@app.post("/api/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    row = db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not row or not check_password_hash(row["password_hash"], password):
+        return json_error("Email or password is incorrect.", 401)
+    session.clear()
+    session["user_id"] = row["id"]
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return jsonify({"ok": True, "user": {"id": row["id"], "full_name": row["full_name"], "email": row["email"], "country": row["country"], "role": row["role"]}})
+
+@app.post("/api/logout")
+@login_required
+def logout():
+    session.clear()
+    return jsonify({"ok": True, "message": "Logged out."})
+
+@app.get("/api/me")
+@login_required
+def me():
+    row = db().execute("SELECT id,full_name,email,country,role,created_at FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    if not row:
+        session.clear()
+        return json_error("Account not found.", 404)
+    return jsonify({"ok": True, "user": dict(row)})
+
+@app.get("/api/assets")
+def assets():
+    return jsonify({"ok": True, "assets": [
+        {"id":"real-estate","name":"Real Estate","risk_note":"Property values and income can fall; liquidity and title risk matter."},
+        {"id":"precious-metals","name":"Gold & Precious Metals","risk_note":"Prices fluctuate; storage, custody and spreads matter."},
+        {"id":"energy","name":"Oil & Energy","risk_note":"Highly sensitive to supply, demand, geopolitics and regulation."},
+        {"id":"digital-assets","name":"Digital Assets","risk_note":"High volatility, custody and network risks; loss can be substantial."},
+        {"id":"private-markets","name":"Private Markets & Business","risk_note":"Illiquidity, valuation uncertainty and business risks apply."},
+        {"id":"infrastructure","name":"Infrastructure & Alternatives","risk_note":"Project, counterparty, regulatory and liquidity risks apply."}
+    ]})
+
+@app.get("/api/tiers")
+def tiers():
+    return jsonify({"ok": True, "tiers": [
+        {"name":"Starter","minimum_usd":100,"maximum_usd":999},
+        {"name":"Silver","minimum_usd":1000,"maximum_usd":4999},
+        {"name":"Gold","minimum_usd":5000,"maximum_usd":9999},
+        {"name":"Platinum","minimum_usd":10000,"maximum_usd":24999},
+        {"name":"Diamond","minimum_usd":25000,"maximum_usd":49999},
+        {"name":"Executive","minimum_usd":50000,"maximum_usd":99999},
+        {"name":"Institutional","minimum_usd":100000,"maximum_usd":499999},
+        {"name":"Sovereign","minimum_usd":500000,"maximum_usd":1000000}
+    ], "notice":"These are draft website access bands only, not investment offers, account balances, or proof of eligibility."})
+
+@app.get("/api/admin/overview")
+@login_required
+def admin_overview():
+    row = db().execute("SELECT role FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    if not row or row["role"] != "admin":
+        return json_error("Administrator access required.", 403)
+    count = db().execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    return jsonify({"ok": True, "registered_users": count, "note":"No deposits, withdrawals, returns, or balances are maintained by this starter."})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)
