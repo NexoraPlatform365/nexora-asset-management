@@ -256,7 +256,7 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
 })();
 
 document.getElementById('year').textContent=new Date().getFullYear();
-window.addEventListener('load',()=>{restoreDashboard()});
+window.addEventListener('load',()=>{restoreDashboard();if(location.hash==='#register'){setTimeout(()=>openModal('registerModal'),250);}});
 </script>
 <!-- NEXORA_DEMO_LOGIN_CONNECTED: forms call the deployed API -->
 </body>
