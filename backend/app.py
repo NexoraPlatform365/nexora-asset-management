@@ -91,6 +91,12 @@ def login_required(fn):
         return fn(*args, **kwargs)
     return wrapped
 
+@app.get("/")
+def root_status():
+    # Render and uptime checks may request the service root. Keep this endpoint
+    # informational; all account actions remain under /api/.
+    return jsonify({"ok": True, "service": "Nexora API", "status": "online", "health": "/api/health"})
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "Nexora API starter", "mode": "account-demo", "time": datetime.now(timezone.utc).isoformat()})
