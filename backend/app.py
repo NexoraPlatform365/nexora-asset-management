@@ -109,6 +109,25 @@ def init_db():
               created_at TEXT NOT NULL
             );
             """)
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS account_ledger (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
+              entry_type TEXT NOT NULL, asset_code TEXT NOT NULL, amount NUMERIC NOT NULL,
+              status TEXT NOT NULL DEFAULT 'posted', reference TEXT, note TEXT, created_by INTEGER, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS payment_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
+              request_type TEXT NOT NULL, asset_code TEXT NOT NULL, amount NUMERIC NOT NULL,
+              wallet_address TEXT, network TEXT, tx_hash TEXT, status TEXT NOT NULL DEFAULT 'pending',
+              admin_note TEXT, reviewed_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS investment_cycles (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
+              asset_name TEXT NOT NULL, principal NUMERIC NOT NULL, asset_code TEXT NOT NULL, roi_rate NUMERIC,
+              start_at TEXT NOT NULL, end_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+              actual_pnl NUMERIC, created_by INTEGER, created_at TEXT NOT NULL
+            );
+            """)
             conn.commit()
         finally:
             conn.close()
