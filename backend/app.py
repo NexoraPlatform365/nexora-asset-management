@@ -91,6 +91,9 @@ def init_db():
                 )
             """)
             init_finance_tables(conn)
+            admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+            if admin_email:
+                conn.execute("UPDATE users SET role='admin' WHERE lower(email)=%s", (admin_email,))
             conn.commit()
         finally:
             conn.close()
@@ -128,6 +131,9 @@ def init_db():
               actual_pnl NUMERIC, created_by INTEGER, created_at TEXT NOT NULL
             );
             """)
+            admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+            if admin_email:
+                conn.execute("UPDATE users SET role='admin' WHERE lower(email)=?", (admin_email,))
             conn.commit()
         finally:
             conn.close()
@@ -345,12 +351,81 @@ def review_payment_request(request_id):
     row=execute('SELECT * FROM payment_requests WHERE id=?',(request_id,)).fetchone()
     if not row: return json_error('Payment request not found.',404)
     if row['status'] in {'approved','rejected','completed'}: return json_error('Request already finalized.',409)
+    if row['request_type']=='deposit' and decision=='approve':
+        if not row['tx_hash'] or not row['network']:
+            return json_error('A deposit can only be credited after its transaction hash and network have been recorded and independently verified.',400)
+        duplicate=execute('SELECT id FROM payment_requests WHERE tx_hash=? AND id<>? AND status IN (\'approved\',\'completed\')',(row['tx_hash'],request_id)).fetchone()
+        if duplicate:
+            return json_error('This transaction hash has already been credited to another request.',409)
+        if len(note.strip())<10:
+            return json_error('Record a review note describing how the transaction was verified before approving.',400)
+    if row['request_type']=='withdrawal' and decision=='complete':
+        return json_error('Do not mark a withdrawal complete here. Record completion only after the payout provider confirms the transfer.',400)
     status={'approve':'approved','reject':'rejected','processing':'processing','complete':'completed'}[decision]; now=datetime.now(timezone.utc).isoformat()
     execute('UPDATE payment_requests SET status=?,admin_note=?,reviewed_by=?,updated_at=? WHERE id=?',(status,note,session['user_id'],now,request_id))
     if row['request_type']=='deposit' and decision=='approve':
-        execute('INSERT INTO account_ledger(user_id,entry_type,asset_code,amount,status,reference,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(row['user_id'],'deposit_credit',row['asset_code'],row['amount'],'posted',row['tx_hash'] or ('deposit-request-'+str(request_id)),note or 'Admin-approved deposit',session['user_id'],now))
+        execute('INSERT INTO account_ledger(user_id,entry_type,asset_code,amount,status,reference,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(row['user_id'],'deposit_credit',row['asset_code'],row['amount'],'posted',row['tx_hash'],note,session['user_id'],now))
     db().commit()
-    return jsonify({'ok':True,'request_id':request_id,'status':status})
+    return jsonify({'ok':True,'request_id':request_id,'status':status,'message':'Deposit credited only after an administrator recorded transaction verification.' if row['request_type']=='deposit' and decision=='approve' else 'Request status updated.'})
+
+@app.post('/api/admin/investment-cycles')
+@login_required
+def admin_create_investment_cycle():
+    admin, err = require_admin()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    try:
+        user_id = int(data.get('user_id'))
+        principal = float(data.get('principal'))
+    except (TypeError, ValueError):
+        return json_error('Valid investor ID and principal amount required.', 400)
+    asset_name = str(data.get('asset_name', '')).strip()[:120]
+    asset_code = str(data.get('asset_code', '')).strip().upper()
+    start_at = str(data.get('start_at', '')).strip()
+    end_at = str(data.get('end_at', '')).strip()
+    if principal <= 0 or principal > 1e18 or not asset_name or not asset_code or len(asset_code) > 12 or not start_at or not end_at or end_at <= start_at:
+        return json_error('Provide valid investment details and an end time after the start time.', 400)
+    if not execute('SELECT id FROM users WHERE id=?', (user_id,)).fetchone():
+        return json_error('Investor not found.', 404)
+    # Expected ROI is informational only; actual profit/loss is recorded separately after the cycle.
+    try:
+        roi_rate = float(data.get('roi_rate')) if data.get('roi_rate') not in (None, '') else None
+    except (TypeError, ValueError):
+        return json_error('ROI rate must be numeric when supplied.', 400)
+    if roi_rate is not None and (roi_rate < 0 or roi_rate > 1000):
+        return json_error('ROI rate is outside the accepted input range.', 400)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = execute('INSERT INTO investment_cycles(user_id,asset_name,principal,asset_code,roi_rate,start_at,end_at,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,\'active\',?,?) RETURNING id', (user_id,asset_name,principal,asset_code,roi_rate,start_at,end_at,session['user_id'],now))
+    cycle_id = cur.fetchone()['id']
+    execute('INSERT INTO account_ledger(user_id,entry_type,asset_code,amount,status,reference,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)', (user_id,'investment_allocation',asset_code,-principal,'posted','cycle-'+str(cycle_id),'Principal allocated to '+asset_name,session['user_id'],now))
+    db().commit()
+    return jsonify({'ok':True,'cycle_id':cycle_id,'status':'active','message':'Cycle recorded. Any return remains unconfirmed until actual results are recorded.'}),201
+
+@app.post('/api/admin/investment-cycles/<int:cycle_id>/settle')
+@login_required
+def admin_settle_investment_cycle(cycle_id):
+    admin, err = require_admin()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    try:
+        actual_pnl = float(data.get('actual_pnl'))
+    except (TypeError, ValueError):
+        return json_error('Enter the actual realized profit or loss amount.', 400)
+    if abs(actual_pnl) > 1e18:
+        return json_error('Amount is outside the accepted range.', 400)
+    row = execute('SELECT * FROM investment_cycles WHERE id=?', (cycle_id,)).fetchone()
+    if not row: return json_error('Investment cycle not found.', 404)
+    if row['status'] != 'active': return json_error('Only active cycles can be settled once.', 409)
+    now = datetime.now(timezone.utc).isoformat()
+    # Return principal plus documented actual P&L. A loss cannot create a negative principal refund.
+    principal = float(row['principal'])
+    pnl = max(actual_pnl, -principal)
+    execute('UPDATE investment_cycles SET actual_pnl=?,status=\'settled\' WHERE id=? AND status=\'active\'', (pnl,cycle_id))
+    execute('INSERT INTO account_ledger(user_id,entry_type,asset_code,amount,status,reference,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)', (row['user_id'],'investment_principal_return',row['asset_code'],principal,'posted','cycle-'+str(cycle_id),'Principal returned on cycle settlement',session['user_id'],now))
+    if pnl:
+        execute('INSERT INTO account_ledger(user_id,entry_type,asset_code,amount,status,reference,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)', (row['user_id'],'investment_realized_pnl',row['asset_code'],pnl,'posted','cycle-'+str(cycle_id),'Actual realized profit/loss recorded by administrator',session['user_id'],now))
+    db().commit()
+    return jsonify({'ok':True,'cycle_id':cycle_id,'status':'settled','actual_pnl':pnl,'message':'Settled using recorded actual results, not the displayed expected ROI.'})
 
 @app.get("/api/admin/overview")
 @login_required
