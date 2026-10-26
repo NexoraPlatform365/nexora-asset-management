@@ -118,7 +118,7 @@ def csrf_token():
 
 @app.before_request
 def protect_mutations():
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.endpoint not in {"health"}:
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.endpoint not in {"health", "register", "login"}:
         supplied = request.headers.get("X-CSRF-Token", "")
         expected = session.get("csrf_token", "")
         if not expected or not secrets.compare_digest(supplied, expected):
