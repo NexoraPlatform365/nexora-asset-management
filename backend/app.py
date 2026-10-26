@@ -18,12 +18,12 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="None",
     MAX_CONTENT_LENGTH=32 * 1024,
 )
-ALLOWED_ORIGIN = "https://nexora-global-investments.onrender.com"
+ALLOWED_ORIGINS = {"https://nexora-global-investments.onrender.com", "https://nexoraplatform365.github.io"}
 
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin", "")
-    if origin == ALLOWED_ORIGIN:
+    if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-CSRF-Token"
