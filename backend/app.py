@@ -87,9 +87,11 @@ def init_db():
                     country TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'investor',
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    referrer_id BIGINT REFERENCES users(id)
                 )
             """)
+            conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT REFERENCES users(id)")
             init_finance_tables(conn)
             admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
             if admin_email:
@@ -109,9 +111,15 @@ def init_db():
               country TEXT NOT NULL,
               password_hash TEXT NOT NULL,
               role TEXT NOT NULL DEFAULT 'investor',
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              referrer_id INTEGER REFERENCES users(id)
             );
             """)
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER REFERENCES users(id)")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
             conn.executescript("""
             CREATE TABLE IF NOT EXISTS account_ledger (
               id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
@@ -192,6 +200,15 @@ def register():
     email = str(data.get("email", "")).strip().lower()
     country = str(data.get("country", "")).strip()
     password = str(data.get("password", ""))
+    referral_code = str(data.get("referral_code", "")).strip()
+    referrer_id = None
+    if referral_code:
+        try:
+            candidate = int(referral_code)
+            if candidate > 0 and execute("SELECT id FROM users WHERE id=? AND role='investor'", (candidate,)).fetchone():
+                referrer_id = candidate
+        except (TypeError, ValueError):
+            referrer_id = None
     if not full_name or len(full_name) > 120 or not country or len(country) > 80:
         return json_error("Enter your full name and country.", 400)
     if "@" not in email or len(email) > 254:
@@ -201,14 +218,14 @@ def register():
     try:
         if USE_POSTGRES:
             cur = execute(
-                "INSERT INTO users(full_name,email,country,password_hash,created_at) VALUES(?,?,?,?,?) RETURNING id",
-                (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat())
+                "INSERT INTO users(full_name,email,country,password_hash,created_at,referrer_id) VALUES(?,?,?,?,?,?) RETURNING id",
+                (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat(), referrer_id)
             )
             user_id = cur.fetchone()["id"]
         else:
             cur = execute(
-                "INSERT INTO users(full_name,email,country,password_hash,created_at) VALUES(?,?,?,?,?)",
-                (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat())
+                "INSERT INTO users(full_name,email,country,password_hash,created_at,referrer_id) VALUES(?,?,?,?,?,?)",
+                (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat(), referrer_id)
             )
             user_id = cur.lastrowid
         admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
@@ -253,6 +270,13 @@ def me():
         session.clear()
         return json_error("Account not found.", 404)
     return jsonify({"ok": True, "user": dict(row)})
+
+@app.get("/api/referrals")
+@login_required
+def referrals():
+    user_id = session["user_id"]
+    rows = execute("SELECT id, full_name, created_at FROM users WHERE referrer_id=? ORDER BY id DESC LIMIT 500", (user_id,)).fetchall()
+    return jsonify({"ok": True, "referral_code": user_id, "referral_count": len(rows), "referrals": [dict(x) for x in rows]})
 
 @app.get("/api/assets")
 def assets():
