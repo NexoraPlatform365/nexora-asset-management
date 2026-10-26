@@ -211,6 +211,9 @@ def register():
                 (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat())
             )
             user_id = cur.lastrowid
+        admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+        if admin_email and email == admin_email:
+            execute("UPDATE users SET role='admin' WHERE id=?", (user_id,))
         db().commit()
     except Exception as exc:
         db().rollback()
@@ -221,7 +224,7 @@ def register():
     session.clear()
     session["user_id"] = user_id
     session["csrf_token"] = secrets.token_urlsafe(32)
-    return jsonify({"ok": True, "message": "Investor portal account created. Investment services appear when enabled for your account.", "user": {"id": user_id, "full_name": full_name, "email": email, "country": country}}), 201
+    return jsonify({"ok": True, "message": "Investor portal account created. Investment services appear when enabled for your account.", "user": {"id": user_id, "full_name": full_name, "email": email, "country": country, "role": "admin" if email == os.getenv("ADMIN_EMAIL", "").strip().lower() and os.getenv("ADMIN_EMAIL", "").strip() else "investor"}}), 201
 
 @app.post("/api/login")
 def login():
