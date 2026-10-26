@@ -138,7 +138,7 @@ def root_status():
 
 @app.get("/api/health")
 def health():
-    status = {"ok": True, "service": "Nexora API", "mode": "account-demo", "time": datetime.now(timezone.utc).isoformat(), "database": "postgresql" if USE_POSTGRES else "sqlite"}
+    status = {"ok": True, "service": "Nexora API", "mode": "investor-portal", "time": datetime.now(timezone.utc).isoformat(), "database": "postgresql" if USE_POSTGRES else "sqlite"}
     try:
         execute("SELECT 1").fetchone()
         status["database_status"] = "connected"
@@ -189,7 +189,7 @@ def register():
     session.clear()
     session["user_id"] = user_id
     session["csrf_token"] = secrets.token_urlsafe(32)
-    return jsonify({"ok": True, "message": "Account created. This is a starter account system, not a verified investment account.", "user": {"id": user_id, "full_name": full_name, "email": email, "country": country}}), 201
+    return jsonify({"ok": True, "message": "Investor portal account created. Investment services appear when enabled for your account.", "user": {"id": user_id, "full_name": full_name, "email": email, "country": country}}), 201
 
 @app.post("/api/login")
 def login():
@@ -250,7 +250,7 @@ def admin_overview():
     if not row or row["role"] != "admin":
         return json_error("Administrator access required.", 403)
     count = execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-    return jsonify({"ok": True, "registered_users": count, "note":"No deposits, withdrawals, returns, or balances are maintained by this starter."})
+    return jsonify({"ok": True, "registered_users": count, "note":"Investment transaction and balance services are not connected."})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)
