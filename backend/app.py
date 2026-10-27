@@ -1,6 +1,8 @@
 import os
 import secrets
 import sqlite3
+import json
+import urllib.request
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -94,6 +96,8 @@ def init_db():
                 )
             """)
             conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT REFERENCES users(id)")
+            conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT TRUE")
+            conn.execute("CREATE TABLE IF NOT EXISTS email_verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, last_sent_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)")
             init_finance_tables(conn)
             admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
             if admin_email:
@@ -122,7 +126,12 @@ def init_db():
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower(): raise
             conn.executescript("""
+            CREATE TABLE IF NOT EXISTS email_verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, last_sent_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS account_ledger (
               id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
               entry_type TEXT NOT NULL, asset_code TEXT NOT NULL, amount NUMERIC NOT NULL,
@@ -150,6 +159,22 @@ def init_db():
             conn.close()
 
 init_db()
+
+def send_verification_email(email, code):
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Email delivery is not configured.")
+    payload = {"sender": {"name": os.getenv("BREVO_SENDER_NAME", "Nexora global investment plc"), "email": os.getenv("BREVO_SENDER_EMAIL", "Customerservicetrust467@gmail.com")}, "to": [{"email": email}], "subject": "Your Nexora verification code", "textContent": "Your Nexora verification code is " + code + ". It expires in 10 minutes. If you did not create this account, ignore this email."}
+    req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", data=json.dumps(payload).encode(), headers={"api-key": api_key, "accept": "application/json", "content-type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as response:
+        if response.status not in (200, 201, 202): raise RuntimeError("Email provider rejected the request.")
+
+def issue_verification(email):
+    code = f"{secrets.randbelow(1000000):06d}"
+    now = datetime.now(timezone.utc)
+    execute("INSERT INTO email_verification_codes(email,code_hash,expires_at,last_sent_at,attempts) VALUES(?,?,?,?,0) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash, expires_at=excluded.expires_at, last_sent_at=excluded.last_sent_at, attempts=0", (email, generate_password_hash(code), str(now.timestamp() + 600), now.isoformat()))
+    db().commit()
+    send_verification_email(email, code)
 
 def json_error(message, code):
     return jsonify({"ok": False, "error": message}), code
@@ -221,13 +246,13 @@ def register():
     try:
         if USE_POSTGRES:
             cur = execute(
-                "INSERT INTO users(full_name,email,country,password_hash,created_at,referrer_id) VALUES(?,?,?,?,?,?) RETURNING id",
+                "INSERT INTO users(full_name,email,country,password_hash,created_at,referrer_id,email_verified) VALUES(?,?,?,?,?,?,FALSE) RETURNING id",
                 (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat(), referrer_id)
             )
             user_id = cur.fetchone()["id"]
         else:
             cur = execute(
-                "INSERT INTO users(full_name,email,country,password_hash,created_at,referrer_id) VALUES(?,?,?,?,?,?)",
+                "INSERT INTO users(full_name,email,country,password_hash,created_at,referrer_id,email_verified) VALUES(?,?,?,?,?,?,0)",
                 (full_name, email, country, generate_password_hash(password), datetime.now(timezone.utc).isoformat(), referrer_id)
             )
             user_id = cur.lastrowid
@@ -241,10 +266,52 @@ def register():
             return json_error("An account with that email already exists.", 409)
         app.logger.exception("Registration failed")
         return json_error("Unable to create account right now.", 500)
-    session.clear()
-    session["user_id"] = user_id
-    session["csrf_token"] = secrets.token_urlsafe(32)
-    return jsonify({"ok": True, "message": "Investor portal account created. Investment services appear when enabled for your account.", "user": {"id": user_id, "full_name": full_name, "email": email, "country": country, "role": "admin" if email == os.getenv("ADMIN_EMAIL", "").strip().lower() and os.getenv("ADMIN_EMAIL", "").strip() else "investor"}}), 201
+    try:
+        issue_verification(email)
+    except Exception:
+        app.logger.exception("Verification email could not be sent")
+        return json_error("Account created, but email could not be sent. Use Resend code to try again.", 502)
+    return jsonify({"ok": True, "verification_required": True, "email": email, "message": "A six-digit verification code has been sent. It expires in 10 minutes."}), 201
+
+@app.post("/api/verify-email")
+def verify_email():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    code = str(data.get("code", "")).strip()
+    row = execute("SELECT * FROM email_verification_codes WHERE email=?", (email,)).fetchone()
+    if not row: return json_error("No active code. Request a new code.", 400)
+    if int(row["attempts"]) >= 5: return json_error("Too many incorrect attempts. Request a new code.", 429)
+    if datetime.now(timezone.utc).timestamp() > float(row["expires_at"]):
+        execute("DELETE FROM email_verification_codes WHERE email=?", (email,)); db().commit()
+        return json_error("Code expired. Request a new code.", 400)
+    if len(code) != 6 or not code.isdigit() or not check_password_hash(row["code_hash"], code):
+        execute("UPDATE email_verification_codes SET attempts=attempts+1 WHERE email=?", (email,)); db().commit()
+        return json_error("Verification code is incorrect.", 400)
+    user = execute("SELECT id,full_name,email,country,role FROM users WHERE email=?", (email,)).fetchone()
+    if not user: return json_error("Account not found.", 404)
+    execute("UPDATE users SET email_verified=? WHERE email=?", (True if USE_POSTGRES else 1, email))
+    execute("DELETE FROM email_verification_codes WHERE email=?", (email,)); db().commit()
+    session.clear(); session["user_id"] = user["id"]; session["csrf_token"] = secrets.token_urlsafe(32)
+    return jsonify({"ok": True, "user": dict(user), "message": "Email verified."})
+
+@app.post("/api/resend-verification")
+def resend_verification():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    row = execute("SELECT email_verified FROM users WHERE email=?", (email,)).fetchone()
+    if not row: return json_error("No account found for that email.", 404)
+    if row["email_verified"]: return json_error("This email is already verified. Please log in.", 400)
+    existing = execute("SELECT last_sent_at FROM email_verification_codes WHERE email=?", (email,)).fetchone()
+    if existing:
+        try:
+            if (datetime.now(timezone.utc)-datetime.fromisoformat(existing["last_sent_at"])).total_seconds() < 60:
+                return json_error("Wait one minute before requesting another code.", 429)
+        except Exception: pass
+    try: issue_verification(email)
+    except Exception:
+        app.logger.exception("Resend email failed")
+        return json_error("Could not send the email right now.", 502)
+    return jsonify({"ok": True, "message": "A new verification code has been sent."})
 
 @app.post("/api/login")
 def login():
@@ -254,6 +321,8 @@ def login():
     row = execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
     if not row or not check_password_hash(row["password_hash"], password):
         return json_error("Email or password is incorrect.", 401)
+    if not row["email_verified"]:
+        return jsonify({"ok": False, "error": "Please verify your email before logging in.", "verification_required": True, "email": email}), 403
     session.clear()
     session["user_id"] = row["id"]
     session["csrf_token"] = secrets.token_urlsafe(32)
