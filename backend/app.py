@@ -591,11 +591,24 @@ def admin_settle_investment_cycle(cycle_id):
 @app.get("/api/admin/overview")
 @login_required
 def admin_overview():
-    row = execute("SELECT role FROM users WHERE id=?", (session["user_id"],)).fetchone()
-    if not row or row["role"] != "admin":
-        return json_error("Administrator access required.", 403)
-    count = execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-    return jsonify({"ok": True, "registered_users": count, "note":"Investment transaction and balance services are not connected."})
+    admin, err = require_admin()
+    if err:
+        return err
+    registered = execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    pending_deposits = execute("SELECT COUNT(*) AS n FROM payment_requests WHERE request_type='deposit' AND status='pending'").fetchone()["n"]
+    pending_withdrawals = execute("SELECT COUNT(*) AS n FROM payment_requests WHERE request_type='withdrawal' AND status='pending'").fetchone()["n"]
+    active_cycles = execute("SELECT COUNT(*) AS n FROM investment_cycles WHERE status='active'").fetchone()["n"]
+    ledger_entries = execute("SELECT COUNT(*) AS n FROM account_ledger").fetchone()["n"]
+    return jsonify({
+        "ok": True,
+        "registered_users": registered,
+        "pending_deposits": pending_deposits,
+        "pending_withdrawals": pending_withdrawals,
+        "active_investment_cycles": active_cycles,
+        "ledger_entries": ledger_entries,
+        "payment_provider_connected": False,
+        "note": "Requests and ledger entries are tracked by the portal. Deposits require independent manual verification; withdrawals must be paid through an authorised provider and confirmed before being marked complete."
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)
